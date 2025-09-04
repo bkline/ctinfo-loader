@@ -5,7 +5,7 @@
 from argparse import ArgumentParser
 from datetime import date, datetime, timedelta
 from functools import cached_property
-from json import dump, dumps, loads, load
+from json import JSONDecodeError, dump, dumps, load, loads
 from logging import basicConfig, getLogger
 from os import chdir
 from pathlib import Path
@@ -17,6 +17,7 @@ from warnings import simplefilter
 from elasticsearch import Elasticsearch, helpers
 from elasticsearch.exceptions import ElasticsearchWarning
 from requests import get
+from requests.exceptions import RequestException
 
 
 class Loader:
@@ -55,7 +56,7 @@ class Loader:
     INFO_ALIAS = "listinginfov1"
     TRIAL_ALIAS = "trialtypeinfov1"
     LIMIT = 1000000
-    MIN_SLEEP = .01
+    MIN_SLEEP = 0.01
     MAX_SLEEP = 500
     MAX_PRETTY_URL_LENGTH = 75
     BATCH_SIZE = 500
@@ -81,21 +82,21 @@ class Loader:
         try:
             Path("../dumps").mkdir(exist_ok=True)
             groups = self.groups
-            labels = [label for label in self.labels]
+            labels = list(self.labels)
             if self.dump:
                 self.__dump(groups, labels)
             if self.testing:
                 path = f"../dumps/{self.INFO}-{self.stamp}.json"
-                with open(path, "w") as fp:
+                with open(path, "w", encoding="utf-8") as fp:
                     dump({self.INFO: groups}, fp, indent=2)
                 path = f"../dumps/{self.TRIAL}-{self.stamp}.json"
-                with open(path, "w") as fp:
+                with open(path, "w", encoding="utf-8") as fp:
                     dump({self.TRIAL: labels}, fp, indent=2)
             else:
                 self.__index(groups, labels)
             if self.verbose:
                 stderr.write("done\n")
-        except Exception as e:
+        except (OSError, IOError, JSONDecodeError, ValueError) as e:
             self.logger.exception("failure")
             self.__alert(e)
         elapsed = datetime.now() - start
@@ -123,12 +124,30 @@ class Loader:
             if not path.exists():
                 path = Path("../dumps") / self.opts.concepts
             if not path.exists():
-                raise Exception(f"{self.opts.concepts!r} not found")
+                raise RuntimeError(f"{self.opts.concepts!r} not found")
+
             class CachedConcept:
+                """Property method silliness to silence pylint"""
+
                 def __init__(self, code, name):
-                    self.code = code
-                    self.name = name
-                    self.key = name.lower()
+                    self.__code = code
+                    self.__name = name
+
+                @cached_property
+                def code(self):
+                    """Keep pylint happy"""
+                    return self.__code
+
+                @cached_property
+                def name(self):
+                    """Keep pylint happy"""
+                    return self.__name
+
+                @cached_property
+                def key(self):
+                    """Keep pylint happy"""
+                    return self.name.lower()
+
             with path.open(encoding="utf-8") as fp:
                 return [CachedConcept(*values) for values in load(fp)]
 
@@ -142,7 +161,9 @@ class Loader:
             values = [(c.code, c.name) for c in concepts]
             values = [(int(v[0][1:]), v[0], v[1]) for v in values]
             values = [v[1:] for v in sorted(values)]
-            with open(f"../dumps/concepts-{self.stamp}.json", "w") as fp:
+            with open(
+                f"../dumps/concepts-{self.stamp}.json", "w", encoding="utf-8"
+            ) as fp:
                 dump(values, fp, indent=2)
 
         # We now have the list of Concept objects.
@@ -161,28 +182,15 @@ class Loader:
     @cached_property
     def dump(self):
         """If True, write test data to the file system."""
-        return True if self.opts.dump else False
+        return bool(self.opts.dump)
 
     @cached_property
     def groups(self):
         """Sequence of groups of concepts sharing display names."""
 
         # Use a locally cached dump if one is specified.
-        filename = self.opts.groups
-        if filename:
-            path = self.USER_CWD / filename
-            if not path.exists():
-                path = Path(filename)
-            if not path.exists():
-                path = Path("../dumps") / filename
-            if not path.exists():
-                raise Exception(f"{filename} not found")
-            groups = []
-            with path.open(encoding="utf-8") as fp:
-                for line in fp:
-                    values = loads(line.strip())
-                    if "concept_id" in values:
-                        groups.append(values)
+        groups = self.__load_groups_from_cache()
+        if groups:
             return groups
 
         # If no groups cache, assemble the groups from the concepts.
@@ -190,8 +198,7 @@ class Loader:
         start = datetime.now()
         args = len(self.concepts), datetime.now() - start
         self.logger.info("fetched %d concepts in %s", *args)
-        if self.verbose:
-            stderr.write("\n")
+        newline = "\n"
         for concept in self.concepts:
             if concept.code in self.BAD:
                 continue
@@ -199,7 +206,8 @@ class Loader:
             if not group:
                 group = group_map[concept.key] = Group(self, concept)
                 if self.verbose:
-                    stderr.write(f"\rfound {len(group_map)} groups")
+                    stderr.write(f"{newline}\rfound {len(group_map)} groups")
+                    newline = ""
             group.codes.append(concept.code)
             if len(group.codes) > 1:
                 args = len(group.codes), group.key
@@ -216,16 +224,13 @@ class Loader:
             if len(matches) > 1:
                 matches = " and ".join(matches)
                 error = f"group {group.key} matches overrides {matches}"
-                if self.verbose:
-                    msg = f"\noffending group has codes {group.codes!r}\n"
-                    stderr.write(msg)
-                raise Exception(error)
+                raise ValueError(error)
             if matches:
                 key, override = matches.popitem()
                 if override.matched_by:
                     both = f"{group.key} and {override.matched_by}"
                     error = f"override for {codes} matches {both}"
-                    raise Exception(error)
+                    raise ValueError(error)
                 override.matched_by = group.key
                 if override.url == Override.BLANK:
                     group.url = None
@@ -243,7 +248,7 @@ class Loader:
             if group.url in urls:
                 other = urls[group.url]
                 message = f"{group.url} used by {group.key} and {other}"
-                raise Exception(message)
+                raise RuntimeError(message)
         if self.verbose:
             stderr.write("\n")
         return [group.values for group in groups]
@@ -272,12 +277,14 @@ class Loader:
         with open(self.LABELS, encoding="utf-8") as fp:
             for line in fp:
                 values = line.strip().split("|")
-                url, id, label = [value.strip() for value in values]
-                labels.append({
-                    "pretty_url_name": url,
-                    "id_string": id.strip(),
-                    "label": label.strip(),
-                })
+                url, id_string, label = [value.strip() for value in values]
+                labels.append(
+                    {
+                        "pretty_url_name": url,
+                        "id_string": id_string.strip(),
+                        "label": label.strip(),
+                    }
+                )
         return labels
 
     @cached_property
@@ -302,26 +309,38 @@ class Loader:
         """Command-line options."""
 
         parser = ArgumentParser()
-        parser.add_argument("--debug", action="store_true",
-                            help="do more logging")
-        parser.add_argument("--dump", "-d", action="store_true",
-                            help="save files for testing the API")
+        parser.add_argument("--debug", action="store_true", help="do more logging")
+        parser.add_argument(
+            "--dump", "-d", action="store_true", help="save files for testing the API"
+        )
         parser.add_argument("--host", help="Elasticsearch server")
-        parser.add_argument("--limit", type=int,
-                            help="maximum concepts to fetch from the EVS")
-        parser.add_argument("--sleep", type=float, metavar="SECONDS",
-                            help="longest delay between fetch failures")
-        parser.add_argument("--port", type=int,
-                            help="Elasticsearch port (default 9200)")
-        parser.add_argument("--test", "-t", action="store_true",
-                            help="save to file system, not Elasticsearch")
-        parser.add_argument("--verbose", "-v", action="store_true",
-                            help="show progress on the command line")
-        parser.add_argument("--groups",
-                            help="dump file name for listing info records")
+        parser.add_argument(
+            "--limit", type=int, help="maximum concepts to fetch from the EVS"
+        )
+        parser.add_argument(
+            "--sleep",
+            type=float,
+            metavar="SECONDS",
+            help="longest delay between fetch failures",
+        )
+        parser.add_argument(
+            "--port", type=int, help="Elasticsearch port (default 9200)"
+        )
+        parser.add_argument(
+            "--test",
+            "-t",
+            action="store_true",
+            help="save to file system, not Elasticsearch",
+        )
+        parser.add_argument(
+            "--verbose",
+            "-v",
+            action="store_true",
+            help="show progress on the command line",
+        )
+        parser.add_argument("--groups", help="dump file name for listing info records")
         parser.add_argument("--concepts", help="dump of concept values")
-        parser.add_argument("--auth", "-a",
-                            help="comma-separated username/password")
+        parser.add_argument("--auth", "-a", help="comma-separated username/password")
         return parser.parse_args()
 
     @cached_property
@@ -335,13 +354,13 @@ class Loader:
                 override = Override(line)
                 if override.url in urls:
                     message = f"URL {override.url} in multiple overrides"
-                    raise Exception(message)
+                    raise ValueError(message)
                 for code in override.codes:
                     if not code:
-                        raise Exception(f"empty code in {line}")
+                        raise ValueError(f"empty code in {line}")
                     if code in overrides:
                         message = f"code {code} in multiple overrides"
-                        raise Exception(message)
+                        raise ValueError(message)
                     overrides[code] = override
         return overrides
 
@@ -363,7 +382,7 @@ class Loader:
     @cached_property
     def testing(self):
         """If True, write to file system instead of Elasticsearch."""
-        return True if self.opts.test else False
+        return bool(self.opts.test)
 
     @cached_property
     def tokens(self):
@@ -384,7 +403,7 @@ class Loader:
     @cached_property
     def verbose(self):
         """Show progress (for running from the command line)."""
-        return True if self.opts.verbose else False
+        return bool(self.opts.verbose)
 
     def __alert(self, e):
         """Send out email notification on failure.
@@ -401,7 +420,7 @@ class Loader:
     def __cleanup(self):
         """Prune old indices."""
 
-        indices = self.es.cat.indices(format="json")
+        indices = self.es.cat.indices(params={"format": "json"})
         cutoff_date = date.today() - timedelta(self.DAYS_TO_KEEP)
         stamp = cutoff_date.strftime("%Y%m%d")
         for alias in (self.INFO_ALIAS, self.TRIAL_ALIAS):
@@ -414,7 +433,7 @@ class Loader:
                 if name.startswith(pattern):
                     candidates.append(name)
             kept = min(len(candidates), self.INDICES_TO_KEEP)
-            candidates = sorted(candidates)[:-self.INDICES_TO_KEEP]
+            candidates = sorted(candidates)[: -self.INDICES_TO_KEEP]
             for name in candidates:
                 if name < cutoff:
                     self.logger.info("dropping index %s", name)
@@ -435,12 +454,14 @@ class Loader:
             for old_index in aliases:
                 if "aliases" in aliases[old_index]:
                     if alias in aliases[old_index]["aliases"]:
-                        actions.append({
-                            "remove": {
-                                "index": old_index,
-                                "alias": alias,
+                        actions.append(
+                            {
+                                "remove": {
+                                    "index": old_index,
+                                    "alias": alias,
+                                }
                             }
-                        })
+                        )
         actions.append({"add": {"index": index, "alias": alias}})
         self.logger.debug("actions: %s", actions)
         self.es.indices.update_aliases(body={"actions": actions})
@@ -455,13 +476,13 @@ class Loader:
 
         action = {"index": {"_index": self.INFO_ALIAS}}
         action = dumps(action)
-        with open(f"../dumps/{self.INFO}.jsonl", "w") as fp:
+        with open(f"../dumps/{self.INFO}.jsonl", "w", encoding="utf-8") as fp:
             for group in groups:
                 fp.write(f"{action}\n")
                 fp.write(f"{dumps(group)}\n")
         action = {"index": {"_index": self.TRIAL_ALIAS}}
         action = dumps(action)
-        with open(f"../dumps/{self.TRIAL}.jsonl", "w") as fp:
+        with open(f"../dumps/{self.TRIAL}.jsonl", "w", encoding="utf-8") as fp:
             for label in labels:
                 fp.write(f"{action}\n")
                 fp.write(f"{dumps(label)}\n")
@@ -487,15 +508,15 @@ class Loader:
         while True:
             sleep(seconds)
             try:
-                response = get(url, timeout=5)
+                response = get(url, timeout=300)
                 concepts = response.json()
                 break
-            except Exception:
+            except (RequestException, JSONDecodeError) as e:
                 self.logger.exception(url)
                 seconds *= 2
                 if seconds > self.max_sleep:
                     self.logger.error("EVS has died -- bailing")
-                    raise Exception("EVS has died")
+                    raise RuntimeError("EVS has died") from e
         if len(codes) != len(concepts):
             self.logger.warning("got %d concepts for %r", len(concepts), codes)
             self.logger.warning(response.text)
@@ -519,7 +540,7 @@ class Loader:
             i = 0
             children = list(children)
             while i < len(children):
-                self.__fetch(children[i:i+self.BATCH_SIZE], concept_dictionary)
+                self.__fetch(children[i : i + self.BATCH_SIZE], concept_dictionary)
                 i += self.BATCH_SIZE
 
     def __index(self, groups, labels):
@@ -541,21 +562,17 @@ class Loader:
         self.es.indices.create(index=trial_index, **self.trial_def)
         if self.verbose:
             stderr.write("indexes created\n")
-        if self.verbose:
-            done = 0
         actions = [{"_index": info_index, "_source": g} for g in groups]
         helpers.bulk(self.es, actions)
         if self.verbose:
             stderr.write(f"{info_index} populated\n")
-            done = 0
         actions = [{"_index": trial_index, "_source": l} for l in labels]
         helpers.bulk(self.es, actions)
         if self.verbose:
             stderr.write(f"{trial_index} populated\n")
-        opts = {"max_num_segments": 1, "index": info_index}
-        self.es.indices.forcemerge(**opts)
-        opts["index"] = trial_index
-        self.es.indices.forcemerge(**opts)
+        params = {"max_num_segments": 1}
+        self.es.indices.forcemerge(index=info_index, params=params)
+        self.es.indices.forcemerge(index=trial_index, params=params)
         if self.verbose:
             stderr.write("indexes merged\n")
         if not self.opts.limit:
@@ -568,6 +585,27 @@ class Loader:
                 stderr.write("old indices pruned\n")
         self.logger.info("indexing completed in %s", datetime.now() - start)
 
+    def __load_groups_from_cache(self):
+        """Broken out to keep pylint happy"""
+
+        filename = self.opts.groups
+        if not filename:
+            return None
+        path = self.USER_CWD / filename
+        if not path.exists():
+            path = Path(filename)
+        if not path.exists():
+            path = Path("../dumps") / filename
+        if not path.exists():
+            raise RuntimeError(f"{filename} not found")
+        groups = []
+        with path.open(encoding="utf-8") as fp:
+            for line in fp:
+                values = loads(line.strip())
+                if "concept_id" in values:
+                    groups.append(values)
+        return groups
+
 
 class Override:
     """Replacement values for a group of concepts."""
@@ -579,34 +617,57 @@ class Override:
     def __init__(self, line):
         """Parse the replacement record.
 
+        Original version did all the work in the constructor. Broken out into
+        property methods to make pylint happy.
+
         Pass:
           line - override values in the form CODE[,CODE[,...]]|LABEL|URL
         """
 
+        self.__line = line.strip()
         self.matched_by = None
-        line = line.strip()
-        fields = line.split("|")
+
+    @cached_property
+    def __fields(self):
+        """Components of the override definition"""
+        fields = self.__line.split("|")
         if len(fields) != 3:
-            raise Exception(f"malformed override {line}")
-        codes, label, url = fields
-        codes = codes.split(",")
-        self.codes = {code.strip().upper() for code in codes}
-        if not self.codes:
-            raise Exception(f"missing codes in {line}")
-        for code in self.codes:
+            raise ValueError(f"malformed override {self.__line}")
+        return fields
+
+    @cached_property
+    def codes(self):
+        """Codes for concepts using the override"""
+
+        codes = {code.strip().upper() for code in self.__fields[0].split(",")}
+        if not codes:
+            raise ValueError(f"missing codes in {self.__line}")
+        for code in codes:
             if not code:
-                raise Exception(f"empty code in {line.strip()}")
-        self.label = label.strip()
-        if not self.label:
-            raise Exception(f"empty label in {line}")
-        self.url = url.strip()
-        if not self.url:
-            raise Exception(f"empty URL in {line}")
-        if not self.URL_PATTERN.match(self.url):
-            if self.url not in (self.BLANK, self.INHERIT):
-                raise Exception(f"invalid override URL {url!r}")
-        if len(self.url) > Loader.MAX_PRETTY_URL_LENGTH:
-            raise Exception("override URL {url} is too long")
+                raise ValueError(f"empty code in {self.__line}")
+        return codes
+
+    @cached_property
+    def label(self):
+        """Label to use for the override"""
+
+        label = self.__fields[1].strip()
+        if not label:
+            raise ValueError(f"empty label in {self.__line}")
+        return label
+
+    @cached_property
+    def url(self):
+        """URL to use for the override"""
+
+        url = self.__fields[2].strip()
+        if not url:
+            raise ValueError(f"empty URL in {self.__line}")
+        if not self.URL_PATTERN.match(url):
+            if url not in (self.BLANK, self.INHERIT):
+                raise ValueError(f"invalid override URL {url!r}")
+        if len(url) > Loader.MAX_PRETTY_URL_LENGTH:
+            raise ValueError(f"override URL {url} is too long")
 
 
 class Concept:
@@ -618,15 +679,17 @@ class Concept:
     def __init__(self, values):
         """Pull out the pieces we need and discard the rest.
 
+        Note:
+            Original version did everything in the constructure, but pylint
+            wasn't happy with that, so we've created a couple of property
+            methods.
+
         Pass:
             values - dictionary of concept values pulled from EVS JSON
         """
 
         display_name = preferred_name = ctrp_name = None
-        try:
-            synonyms = values.get("synonyms", [])
-        except Exception as e:
-            raise Exception(f"concept failure for {values!r}: {e}")
+        synonyms = values.get("synonyms", [])
         for synonym in synonyms:
             if synonym.get("source") == "CTRP":
                 if synonym.get("termType") == "DN":
@@ -639,10 +702,18 @@ class Concept:
                     preferred_name = (synonym.get("name") or "").strip()
                 elif name_type == "Display_Name":
                     display_name = (synonym.get("name") or "").strip()
-        name = ctrp_name or display_name or preferred_name or self.NONE
-        self.name = self.SPACES.sub(" ", name)
-        self.key = self.name.lower()
         self.code = values["code"].upper()
+        self.__name = ctrp_name or display_name or preferred_name or self.NONE
+
+    @cached_property
+    def name(self):
+        """Normalized name string"""
+        return self.SPACES.sub(" ", self.__name)
+
+    @cached_property
+    def key(self):
+        """For dictionary lookup"""
+        return self.name.lower()
 
 
 class Group:
