@@ -668,6 +668,7 @@ class Override:
                 raise ValueError(f"invalid override URL {url!r}")
         if len(url) > Loader.MAX_PRETTY_URL_LENGTH:
             raise ValueError(f"override URL {url} is too long")
+        return url
 
 
 class Concept:
